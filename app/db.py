@@ -112,6 +112,27 @@ def init_db() -> None:
                 created_at  TEXT    NOT NULL
             );
 
+            -- One row per completed cross-pool allocation migration.  The
+            -- UNIQUE operation_id makes a retried migration replay the
+            -- original result instead of moving the allocations twice.
+            -- source_pool_id is a plain historical reference: the source
+            -- pool of a later partition migration is deleted, so no FK;
+            -- target_pool_id keeps the cascade so deleting the destination
+            -- pool removes the record.  params is the canonical request
+            -- fingerprint (manifest order is significant) and result holds
+            -- the stored input-order mapping.
+            CREATE TABLE IF NOT EXISTS allocation_migrations (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                operation_id     TEXT    NOT NULL UNIQUE,
+                source_pool_id   INTEGER NOT NULL,
+                target_pool_id   INTEGER NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+                source_cidr      TEXT    NOT NULL,
+                target_cidr      TEXT    NOT NULL,
+                params           TEXT    NOT NULL,
+                result           TEXT    NOT NULL,
+                created_at       TEXT    NOT NULL
+            );
+
             -- Fast lookup of all plans belonging to one pool.
             CREATE INDEX IF NOT EXISTS idx_allocations_pool
                 ON allocations(pool_id);

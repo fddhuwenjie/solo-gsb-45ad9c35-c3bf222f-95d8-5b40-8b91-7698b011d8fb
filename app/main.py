@@ -11,12 +11,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import bgpplan, partition, reserve, service, snapshot
+from . import bgpplan, migration, partition, reserve, service, snapshot
 from .db import init_db
 from .schemas import (
     AllocateRequest,
     AllocationResponse,
     AllocationItem,
+    AllocationMigrationRequest,
+    AllocationMigrationResponse,
     BatchReserveRequest,
     BatchReserveResponse,
     BgpAuditRequest,
@@ -49,11 +51,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="IPv4 Subnet Allocation API",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "Allocate non-overlapping, aligned IPv4 subnets from address pools, "
         "reserve policy-gated batches of subnets atomically, "
         "partition pools into exactly covering sub-pools, "
+        "migrate in-use allocations between pools while preserving their identity, "
         "build RFC 2317 reverse-DNS delegation plans for current allocations, "
         "statelessly audit BGP announcements against AS relationships, "
         "and record confirmable BGP announcement plans pinned to pool state."
@@ -155,6 +158,26 @@ def add_exclusion(pool_id: int, body: ExclusionCreateRequest) -> ExclusionRespon
 def partition_pool(pool_id: int, body: PartitionRequest) -> PartitionResponse:
     result = partition.partition_pool(pool_id, body.operation_id, body.subnets)
     return PartitionResponse(**result)
+
+
+@app.post(
+    "/pools/{pool_id}/allocation-migrations",
+    response_model=AllocationMigrationResponse,
+    status_code=201,
+    tags=["pools"],
+)
+def migrate_pool_allocations(
+    pool_id: int, body: AllocationMigrationRequest, response: Response
+) -> AllocationMigrationResponse:
+    result = migration.migrate_allocations(
+        pool_id,
+        body.target_pool_id,
+        body.operation_id,
+        [item.request_id for item in body.allocations],
+    )
+    # 201 for a newly recorded migration, 200 for an idempotent replay.
+    response.status_code = 200 if result["replayed"] else 201
+    return AllocationMigrationResponse(**result)
 
 
 @app.post(

@@ -356,6 +356,66 @@ class PartitionResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Cross-pool allocation migration
+# ---------------------------------------------------------------------------
+
+
+class AllocationMigrationItemRequest(BaseModel):
+    request_id: str = Field(
+        ...,
+        min_length=1,
+        description="request_id of an existing allocation in the source pool",
+    )
+
+
+class AllocationMigrationRequest(BaseModel):
+    operation_id: str = Field(
+        ...,
+        min_length=1,
+        description="Client-generated idempotency key for the migration operation",
+    )
+    target_pool_id: int = Field(
+        ..., ge=1, description="Pool the listed allocations are moved to"
+    )
+    allocations: list[AllocationMigrationItemRequest] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Manifest of allocations to move, given by request_id in the "
+            "order the result mapping must follow"
+        ),
+    )
+
+
+class MigratedAllocationResponse(BaseModel):
+    request_id: str
+    cidr: str = Field(..., description="CIDR preserved unchanged by the move")
+    prefix_length: int
+    allocation_id: int = Field(..., description="Row id, preserved by the move")
+    replayed: bool = Field(
+        ...,
+        description="True when this item came from a stored migration replay",
+    )
+
+
+class AllocationMigrationResponse(BaseModel):
+    operation_id: str
+    migration_id: int = Field(..., description="Migration record id")
+    source_pool_id: int
+    target_pool_id: int
+    source_cidr: str
+    target_cidr: str
+    migrated: list[MigratedAllocationResponse] = Field(
+        ...,
+        description="request_id -> CIDR mapping for the moved allocations, in input order",
+    )
+    created_at: str
+    replayed: bool = Field(
+        ..., description="True when a stored migration result was returned"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Stateless BGP announcement auditing
 # ---------------------------------------------------------------------------
 

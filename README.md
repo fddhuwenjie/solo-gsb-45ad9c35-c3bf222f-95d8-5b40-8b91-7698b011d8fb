@@ -11,6 +11,7 @@
 - 可为当前分配生成 **RFC 2317 反向 DNS 委派计划**（只读，非八位边界 CIDR 自动拆分）
 - 池状态可导出为带 **SHA-256 摘要的规范 JSON 快照**，并在一个 SQLite 写事务内校验、恢复（`restore_id` 幂等重放）
 - 可将地址池**分区迁移**为一组两两不重叠、恰好覆盖源池的子池：全部校验与替换在**同一个写事务**内完成，排除网段与已分配子网按归属整体迁入子池（`operation_id` 幂等重放）
+- 可将若干**仍在使用的已分配子网跨池迁移**到目标池：保留原有 CIDR、`request_id` 与分配记录行身份，在**同一个写事务**内固定两池状态并完成归属校验与更新；源池或目标池存在 `planned`/`active` BGP 计划时拒绝迁移（`operation_id` 幂等重放）
 - 可将按优先级排列的 CIDR 允许/拒绝规则**编译**为覆盖整个 scope 的不重叠分段（只读，不触碰地址池与分配数据）
 - 可对 BGP 公告做**无状态 AS 路径审计与 MOAS / 起源变更比对**（只计算，不读写数据库）
 - 可创建**可确认的 BGP 公告计划**：创建时在一致读事务中固定池的排除网段与当前分配、
@@ -67,6 +68,7 @@ SUBNET_DB_PATH=./subnets.db .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port
 | `GET` | `/pools/{id}/snapshot` | 导出带 SHA-256 摘要的规范 JSON 池快照 |
 | `POST` | `/pools/{id}/snapshot/restore` | 校验摘要后在一个写事务内恢复池状态（`restore_id` 幂等） |
 | `POST` | `/pools/{id}/partitions` | 将源池分区迁移为一组恰好覆盖它的子池（单写事务，`operation_id` 幂等） |
+| `POST` | `/pools/{id}/allocation-migrations` | 将清单内已分配子网从源池跨池迁移到目标池，保留 CIDR/request_id/行身份（单写事务，`operation_id` 幂等） |
 | `POST` | `/cidr-policy/compile` | 将优先级 CIDR 规则编译为覆盖 scope 的不重叠动作分段（只读） |
 | `POST` | `/bgp/announcements/audit` | BGP 公告 AS 路径审计与 MOAS / 起源变更比对（无状态，不读写数据库） |
 | `POST` | `/pools/{id}/bgp-plans` | 创建不可变 BGP 公告计划并固定池状态摘要（`plan_id` 幂等） |
@@ -581,7 +583,82 @@ curl -X POST http://localhost:8000/pools/1/partitions \
 `request_id` 幂等键随分配一起归属新子池；子网列表只有一个且等于源池 CIDR 的
 退化分区也是合法请求（源池被同 CIDR 的新池替换，池 id 改变）。
 
-### 13. 可确认的 BGP 公告计划（创建 + 激活）
+### 13. 跨池迁移已分配子网（保留 CIDR / request_id / 行身份）
+
+`POST /pools/{id}/allocation-migrations` 把**仍在使用的若干已分配子网**从源池
+迁移到目标池。调用方提交：
+
+- `operation_id`：整次迁移的幂等键；
+- `target_pool_id`：目标池 id（必须与 URL 中的源池不同，且两池都存在）；
+- `allocations`：按 `request_id` 排列的**迁移清单**，每项形如
+  `{"request_id": "svc-42"}`；返回结果严格按该**输入顺序**映射。
+
+迁移只改变分配记录的归属 `pool_id`，**CIDR、`request_id`、前缀长度、数据库行 id
+与 `created_at` 全部原样保留**——不会按目标池空闲空间重新选址，也不会产生新行。
+
+```bash
+curl -X POST http://localhost:8000/pools/1/allocation-migrations \
+  -H 'Content-Type: application/json' -d '{
+    "operation_id": "cutover-2026-10-04",
+    "target_pool_id": 2,
+    "allocations": [
+      {"request_id": "svc-2"},
+      {"request_id": "svc-1"}
+    ]
+  }'
+```
+
+```json
+{
+  "operation_id": "cutover-2026-10-04",
+  "migration_id": 1,
+  "source_pool_id": 1,
+  "target_pool_id": 2,
+  "source_cidr": "10.0.0.0/24",
+  "target_cidr": "10.0.0.0/16",
+  "migrated": [
+    {"request_id": "svc-2", "cidr": "10.0.0.128/25", "prefix_length": 25,
+     "allocation_id": 2, "replayed": false},
+    {"request_id": "svc-1", "cidr": "10.0.0.0/25", "prefix_length": 25,
+     "allocation_id": 1, "replayed": false}
+  ],
+  "created_at": "2026-10-04T09:00:00+00:00",
+  "replayed": false
+}
+```
+
+**全部校验与写入在同一个 `BEGIN IMMEDIATE` 写事务内完成**（进入事务即固定源池与
+目标池两份状态），依次校验：
+
+1. 清单非空且 `request_id` **无重复**（`422 migration_duplicate_request_id`）；
+2. 每个 `request_id` 都对应一条现存分配，且**确属源池**：不存在返回
+   `404 allocation_not_found`，属于其他池返回 `409 migration_allocation_not_in_source`；
+3. 每条待迁移 CIDR 都**完全包含在目标池内**
+   （`422 migration_allocation_outside_target`）；源池与目标池允许重叠，
+   不要求源池整体位于目标池；
+4. 待迁移 CIDR 不得与目标池的**排除网段**重叠
+   （`409 migration_allocation_overlaps_exclusion`），也不得与目标池**其余分配**
+   （清单之外的既有分配）重叠（`409 migration_allocation_overlap`）；
+5. **源池或目标池任一存在 `planned` 或 `active` BGP 公告计划时拒绝迁移**
+   （`409 migration_blocked_by_bgp_plan`）：BGP 计划固定了池的排除与分配摘要，
+   迁移会让计划摘要与池状态脱节，因此有计划时必须先处理计划再迁移。
+
+全部通过后，在同一事务内把这些分配行的 `pool_id` 更新为目标池并写入迁移记录；
+任一步失败**整体回滚，源池与目标池都不改动**——清单内排在前面的项也不会被
+"先迁过去"。迁移后两池仍然都存在：源池少了这些分配（其空闲表示相应恢复），
+目标池多出这些 CIDR 原样不变的分配，并对状态查询、快照、反向 DNS 计划、释放与
+`request_id` 幂等等全部既有接口可见。
+
+**幂等语义**：
+
+- 相同 `operation_id` + 相同源池、目标池与相同清单（**顺序也必须一致**，顺序
+  决定返回映射）重试，返回**原始结果**（HTTP 200、`replayed: true`），不会二次
+  更新；即使分配随后又被释放、源池已被分区迁移替换，仍回放存储的原结果；
+- 相同 `operation_id` 但源池、目标池或清单（含顺序）变化，返回
+  `409 operation_id_conflict`；
+- 并发使用同一 `operation_id` 由写事务串行化，恰好真正迁移一次，其余请求重放。
+
+### 14. 可确认的 BGP 公告计划（创建 + 激活）
 
 网络团队在正式发布 BGP 公告前，需要确认公告仍对应当前地址池：池内分配一旦变化，
 旧的公告集合可能覆盖了已释放的地址、或漏掉新分配，绝不能把这种过期路由激活出去。
@@ -678,7 +755,7 @@ curl -X POST http://localhost:8000/pools/1/bgp-plans/release-2026-10-03/activate
   也被串行化：要么激活先提交（成功），要么分配先提交（激活返回冲突），不会出现
   部分生效。
 
-### 14. 按策略批量预留（单写事务，整批回滚）
+### 15. 按策略批量预留（单写事务，整批回滚）
 
 `POST /pools/{id}/reservations` 在一个**原子批次**中预留多个子网。调用方提交：
 
@@ -767,6 +844,14 @@ curl -X POST http://localhost:8000/pools/1/reservations \
 | 409 | `operation_id_conflict` | 同一 `operation_id` 曾用于另一源池或另一组子网的分区 |
 | 409 | `partition_pool_conflict` | 子池 CIDR 与其他现有地址池重叠 |
 | 409 | `partition_conflict` | 分区写入时撞上数据库唯一约束 |
+| 409 | `operation_id_conflict` | 同一 `operation_id` 以不同源池/目标池/清单（含顺序）重放跨池迁移 |
+| 409 | `migration_allocation_not_in_source` | 清单项的分配不属于源池（属于其他池或已不在源池） |
+| 409 | `migration_allocation_overlaps_exclusion` | 待迁移 CIDR 与目标池排除网段重叠 |
+| 409 | `migration_allocation_overlap` | 待迁移 CIDR 与目标池其余既有分配重叠 |
+| 409 | `migration_blocked_by_bgp_plan` | 源池或目标池存在 planned/active BGP 公告计划 |
+| 409 | `migration_conflict` | 跨池迁移写入时撞上数据库唯一约束 |
+| 422 | `migration_same_pool` / `migration_duplicate_request_id` | 源池与目标池相同，或清单内 request_id 重复 |
+| 422 | `migration_allocation_outside_target` | 待迁移 CIDR 不完全位于目标池内 |
 | 422 | `partition_outside_pool` / `partition_overlap` / `partition_incomplete` | 分区子网不在源池内、两两重叠（含重复）或未恰好覆盖源池 |
 | 422 | `partition_exclusion_unmapped` / `partition_allocation_unmapped` | 排除网段 / 已分配子网跨越子池边界，未完全落入唯一子池 |
 | 422 | `invalid_cidr` / `invalid_prefix` / `exclusion_outside_pool` | 参数非法 |
@@ -826,6 +911,11 @@ curl -X POST http://localhost:8000/pools/1/reservations \
   完成：并发分区被串行化，对同一源池的并发分区只有一个成功（其余看到源池
   已退役而返回 404）；`pool_migrations.operation_id` 上的 `UNIQUE` 约束保证
   同一操作键并发/重放只真正迁移一次。
+- 已分配子网的**跨池迁移**同样在单个 `BEGIN IMMEDIATE` 写事务内固定源池与
+  目标池两份状态，并在同一事务内完成幂等判定、清单归属、目标包含/排除/重叠与
+  BGP 计划存在性校验，最后更新分配归属并写迁移记录：任一项失败整体回滚，
+  **两个池都不会被部分改动**；`allocation_migrations.operation_id` 上的
+  `UNIQUE` 约束保证同一操作键并发/重放只真正迁移一次。
 - BGP 公告计划在创建时先用一致读事务固定池状态，再于写事务内复查状态未变后落库；
   激活的全部核对（摘要一致、覆盖与单一起源重新成立）与状态翻转都在单个
   `BEGIN IMMEDIATE` 写事务内完成，池状态变化即整体回滚返回冲突；
@@ -845,6 +935,7 @@ curl -X POST http://localhost:8000/pools/1/reservations \
 │   ├── service.py     # 业务逻辑：创建/分配/释放/状态/反向委派计划
 │   ├── snapshot.py    # 池快照导出/恢复：规范 JSON、SHA-256 摘要、幂等替换
 │   ├── partition.py   # 池分区迁移：单写事务校验+替换源池，operation_id 幂等
+│   ├── migration.py   # 已分配子网跨池迁移：单写事务固定两池、保留行身份，operation_id 幂等
 │   ├── reserve.py     # 按策略批量预留：单写事务编译规则+一致快照+按序选取，batch_id 幂等
 │   ├── db.py          # SQLite 连接、建表、事务管理
 │   ├── cidrmath.py    # CIDR 集合运算：差集、合并、最低对齐选取、委派片段拆分
