@@ -112,6 +112,22 @@ def init_db() -> None:
                 created_at  TEXT    NOT NULL
             );
 
+            -- One row per completed cross-pool allocation migration.  The
+            -- UNIQUE operation_id makes a retried migration replay the
+            -- original result instead of moving the allocations twice;
+            -- params is the canonical request fingerprint (source pool,
+            -- target pool, request_id-ordered manifest) used to detect
+            -- conflicting reuses.
+            CREATE TABLE IF NOT EXISTS allocation_migrations (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                operation_id     TEXT    NOT NULL UNIQUE,
+                source_pool_id   INTEGER NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+                target_pool_id   INTEGER NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+                params           TEXT    NOT NULL,
+                result           TEXT    NOT NULL,
+                created_at       TEXT    NOT NULL
+            );
+
             -- Fast lookup of all plans belonging to one pool.
             CREATE INDEX IF NOT EXISTS idx_allocations_pool
                 ON allocations(pool_id);
@@ -119,6 +135,8 @@ def init_db() -> None:
                 ON exclusions(pool_id);
             CREATE INDEX IF NOT EXISTS idx_bgp_plans_pool
                 ON bgp_plans(pool_id);
+            CREATE INDEX IF NOT EXISTS idx_alloc_migrations_target
+                ON allocation_migrations(target_pool_id);
             """
         )
 

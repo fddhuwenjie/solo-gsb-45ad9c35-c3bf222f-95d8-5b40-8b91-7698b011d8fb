@@ -242,6 +242,72 @@ class BatchReserveResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Cross-pool allocation migration
+# ---------------------------------------------------------------------------
+
+
+class AllocationMigrationItemRequest(BaseModel):
+    request_id: str = Field(
+        ...,
+        min_length=1,
+        description="Id of an existing allocation in the source pool",
+    )
+    cidr: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "CIDR currently owned by that allocation; must match the source "
+            "pool record and be completely contained in the target pool"
+        ),
+    )
+
+
+class AllocationMigrationRequest(BaseModel):
+    operation_id: str = Field(
+        ...,
+        min_length=1,
+        description="Client-generated idempotency key for the migration",
+    )
+    target_pool_id: int = Field(
+        ..., ge=1, description="Pool the allocations move to"
+    )
+    allocations: list[AllocationMigrationItemRequest] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "request_id-ordered manifest of allocations to move; request_ids "
+            "must be unique and every item must currently belong to the "
+            "source pool"
+        ),
+    )
+
+
+class AllocationMigrationItemResponse(BaseModel):
+    request_id: str
+    prefix_length: int
+    cidr: str
+    allocation_id: int = Field(..., description="Row id, preserved across the move")
+    replayed: bool = Field(
+        ..., description="True when a stored migration result was returned"
+    )
+
+
+class AllocationMigrationResponse(BaseModel):
+    operation_id: str
+    migration_id: int = Field(..., description="Migration record id")
+    source_pool_id: int
+    target_pool_id: int
+    allocations: list[AllocationMigrationItemResponse] = Field(
+        ...,
+        description="request_id -> CIDR mapping, in the submitted input order",
+    )
+    created_at: str
+    replayed: bool = Field(
+        ..., description="True when a stored migration result was returned"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Pool snapshot export / restore
 # ---------------------------------------------------------------------------
 

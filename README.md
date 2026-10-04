@@ -21,6 +21,10 @@
   按输入顺序为每项选取最小对齐空闲网段，每项必须完全落在 allow 段；命中 deny 或任一项无空间时
   **整批回滚、池不变**；成功后写入普通分配并返回输入顺序的映射（`batch_id` 幂等重放，
   已有 `request_id` 沿用原幂等语义）
+- 可将仍在使用的已分配子网**跨池迁移**：在**同一个写事务**内固定源池与目标池状态，
+  校验 `request_id` 清单无重复且每项确属源池、CIDR 完全位于目标池内、且不碰目标排除网段与
+  其余分配，任一方池存在 planned/active BGP 计划时拒绝；全部通过后原子改写归属，
+  CIDR、`request_id` 与分配行 id 原样保留（`operation_id` 幂等重放）
 - 一条命令启动，监听 **8000** 端口
 
 ## 快速开始
@@ -63,6 +67,7 @@ SUBNET_DB_PATH=./subnets.db .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port
 | `POST` | `/pools/{id}/allocations` | 按前缀长度申请子网（需带 `request_id`） |
 | `POST` | `/pools/{id}/reservations` | 按策略批量预留子网：单写事务、整批回滚（`batch_id` 幂等） |
 | `DELETE` | `/pools/{id}/allocations/{request_id}` | 释放子网 |
+| `POST` | `/pools/{id}/allocation-migrations` | 把源池中仍在使用的已分配子网跨池迁移到目标池（单写事务，`operation_id` 幂等） |
 | `POST` | `/pools/{id}/reverse-dns-plan` | 为当前分配生成 RFC 2317 反向 DNS 委派（只读） |
 | `GET` | `/pools/{id}/snapshot` | 导出带 SHA-256 摘要的规范 JSON 池快照 |
 | `POST` | `/pools/{id}/snapshot/restore` | 校验摘要后在一个写事务内恢复池状态（`restore_id` 幂等） |
@@ -747,6 +752,83 @@ curl -X POST http://localhost:8000/pools/1/reservations \
 - 并发提交不同批次由写事务串行化，不会选中同一块空间；并发使用同一 `batch_id`
   时恰好记录一批，其余请求重放原结果。
 
+### 15. 跨池迁移在用子网（单写事务，原子改归属）
+
+运维需要把**仍在使用的若干已分配子网**从源池切换到目标池，同时保留原有 CIDR、
+`request_id` 和分配记录身份（行 `id`、`prefix_length`、`created_at` 均不变）。
+`POST /pools/{id}/allocation-migrations`（路径中的池即源池）在一次操作中完成这次
+跨池迁移，调用方提交：
+
+- `operation_id`：整次迁移的幂等键；
+- `target_pool_id`：目标池；
+- `allocations`：按 `request_id` 排列的清单，每项含 `request_id` 与 `cidr`，
+  **返回映射的顺序与该输入顺序一致**。
+
+```bash
+curl -X POST http://localhost:8000/pools/1/allocation-migrations \
+  -H 'Content-Type: application/json' -d '{
+    "operation_id": "move-to-core-2026-10-04",
+    "target_pool_id": 2,
+    "allocations": [
+      {"request_id": "edge-2", "cidr": "10.10.0.64/26"},
+      {"request_id": "edge-1", "cidr": "10.10.0.0/26"}
+    ]
+  }'
+```
+
+```json
+{
+  "operation_id": "move-to-core-2026-10-04",
+  "migration_id": 1,
+  "source_pool_id": 1,
+  "target_pool_id": 2,
+  "allocations": [
+    {"request_id": "edge-2", "prefix_length": 26, "cidr": "10.10.0.64/26",
+     "allocation_id": 2, "replayed": false},
+    {"request_id": "edge-1", "prefix_length": 26, "cidr": "10.10.0.0/26",
+     "allocation_id": 1, "replayed": false}
+  ],
+  "created_at": "2026-10-04T09:30:00+00:00",
+  "replayed": false
+}
+```
+
+**全部校验与写入在同一个 `BEGIN IMMEDIATE` 写事务内完成**——进入事务即固定源池与
+目标池的当前状态，依次校验：
+
+1. 清单中的 `request_id` **不得重复**（`422 migration_duplicate_request_id`），
+   每项 CIDR 严格合法（`422 invalid_cidr`，廉价校验在开启事务前完成）；
+2. 源池与目标池都必须存在（源池 `404 pool_not_found`、目标池
+   `404 migration_target_pool_not_found`），且二者不能是同一个池
+   （`422 migration_same_pool`）；
+3. **任一方池存在 `planned` 或 `active` 的 BGP 公告计划时拒绝迁移**
+   （`409 migration_blocked_by_bgp_plan`），避免移动分配后计划固定的池状态摘要与
+   覆盖关系和实际池状态脱节；
+4. 每个 `request_id` 都必须是**源池当前的分配**
+   （`422 migration_allocation_not_in_source`），且其当前 CIDR 必须与提交值**完全
+   一致**（`422 migration_cidr_mismatch`）；
+5. 每个待迁移 CIDR 必须**完全包含在目标池内**（`422 migration_outside_target`），
+   且不得与目标池的**排除网段**重叠
+   （`409 migration_target_exclusion_overlap`），也不得与目标池的**其余分配**重叠
+   ——完全重合或部分重叠都算（`409 migration_target_allocation_overlap`）。
+
+全部通过后才在同一事务内 `UPDATE allocations SET pool_id = ?` 改写归属并写入迁移
+记录：CIDR、`request_id`、行 `id`、`prefix_length`、`created_at` 全部原样保留。
+**任一项失败整体回滚，源池与目标池都不会发生任何改动**；校验失败时 `operation_id`
+也不会被占用，修正请求后可原样重用。迁移后 `request_id` 幂等键随分配归属新池：对新
+池重放分配请求返回原行，对旧池使用同一 `request_id` 则按原语义返回
+`409 request_id_conflict`。排除网段不参与迁移，仍留在各自原池中。
+
+**幂等语义**：
+
+- 相同 `operation_id` + 相同参数（源池、目标池、**按输入顺序**的 `request_id/CIDR`
+  清单，顺序变化也算参数变化）重放时返回原始结果（HTTP 200、`replayed: true`），
+  不会二次迁移；即使此后该分配又被释放、池状态已与清单不符，重放仍返回当初存储的
+  结果，且不会"复活"已释放的行；
+- 相同 `operation_id` 但源池、目标池或清单变化：`409 operation_id_conflict`；
+- 并发使用同一 `operation_id` 由写事务串行化，恰好迁移一次，其余全部重放同一记录；
+  并发的不同迁移也被串行化，不会把两个分配写进重叠的目标空间。
+
 ## 错误响应
 
 统一格式：
@@ -801,6 +883,16 @@ curl -X POST http://localhost:8000/pools/1/reservations \
 | 409 | `bgp_plan_state_conflict` | 计划创建/激活时池状态已变：摘要不一致或覆盖关系不再成立 |
 | 409 | `batch_id_conflict` | 同一 `batch_id` 以不同参数（池、规则或预留项）重放 |
 | 409 | `reservation_denied` | 批内某项选中的最小空闲网段未完全落在 allow 段内（整批回滚） |
+| 404 | `migration_target_pool_not_found` | 跨池迁移的目标池不存在 |
+| 422 | `migration_same_pool` | 跨池迁移的源池与目标池是同一个池 |
+| 422 | `migration_duplicate_request_id` | 迁移清单中同一 `request_id` 出现多次 |
+| 422 | `migration_allocation_not_in_source` | 清单项不是源池当前的分配（不存在或属于其他池） |
+| 422 | `migration_cidr_mismatch` | 清单提交的 CIDR 与该 `request_id` 当前占用的 CIDR 不一致 |
+| 422 | `migration_outside_target` | 待迁移 CIDR 未完全包含在目标池内 |
+| 409 | `migration_target_exclusion_overlap` | 待迁移 CIDR 与目标池排除网段重叠（整批回滚） |
+| 409 | `migration_target_allocation_overlap` | 待迁移 CIDR 与目标池其余分配重叠（整批回滚） |
+| 409 | `migration_blocked_by_bgp_plan` | 源池或目标池存在 planned/active BGP 公告计划 |
+| 409 | `migration_conflict` | 迁移写入时撞上数据库唯一约束 |
 | 422 | `bgp_announcement_outside_pool` | 公告前缀不完全位于地址池内 |
 | 422 | `bgp_announcement_overlaps_exclusion` | 公告前缀与池的排除网段重叠 |
 | 422 | `bgp_allocation_uncovered` | 存在当前分配未被任何审计通过的公告覆盖 |
@@ -835,6 +927,12 @@ curl -X POST http://localhost:8000/pools/1/reservations \
   不会选中同一块空闲空间；任一项失败（命中 deny、空间不足、`request_id` 冲突）
   整体回滚，**不会留下部分预留**；`reservation_batches.batch_id` 主键保证同一批次键
   并发/重放只真正执行一次。
+- 跨池子网迁移的**全部工作**（`operation_id` 幂等判定、源/目标池状态固定、BGP 计划
+  检查、归属与重叠校验、`UPDATE` 改写归属、写迁移记录）都在单个 `BEGIN IMMEDIATE`
+  写事务内完成：两池状态在同一事务视图内固定，并发迁移被串行化，不会把分配写进重叠
+  的目标空间；任一校验失败整体回滚，**源池与目标池都不变**；
+  `allocation_migrations.operation_id` 上的 `UNIQUE` 约束保证同一操作键并发/重放只真正
+  迁移一次。
 - 数据库开启 WAL 模式，读状态不会阻塞写分配。
 
 ## 项目结构
@@ -845,6 +943,7 @@ curl -X POST http://localhost:8000/pools/1/reservations \
 │   ├── service.py     # 业务逻辑：创建/分配/释放/状态/反向委派计划
 │   ├── snapshot.py    # 池快照导出/恢复：规范 JSON、SHA-256 摘要、幂等替换
 │   ├── partition.py   # 池分区迁移：单写事务校验+替换源池，operation_id 幂等
+│   ├── migrate.py     # 跨池迁移在用分配：单写事务固定两池状态+原子改归属，operation_id 幂等
 │   ├── reserve.py     # 按策略批量预留：单写事务编译规则+一致快照+按序选取，batch_id 幂等
 │   ├── db.py          # SQLite 连接、建表、事务管理
 │   ├── cidrmath.py    # CIDR 集合运算：差集、合并、最低对齐选取、委派片段拆分
